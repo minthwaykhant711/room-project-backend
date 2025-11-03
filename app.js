@@ -92,7 +92,7 @@ app.get("/api/bookings_by_date", (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ message: "Date is required" });
   const sql = `
-    SELECT room_id, slot_id, booking_status 
+    SELECT room_id, slot_id, booking_status, user_id 
     FROM booking 
     WHERE booking_date = ? AND (booking_status = 'Approved' OR booking_status = 'Waiting')
   `;
