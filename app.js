@@ -53,6 +53,48 @@ app.post("/login", (req, res) => {
     });
   });
 });
+// ===============================
+// REGISTER (Sign Up)
+// ===============================
+app.post("/register", async (req, res) => {
+  const { first_name, last_name, email, password, role } = req.body;
+
+  if (!first_name || !last_name || !email || !password) {
+    return res.status(400).json({ message: "All fields are required" });
+  }
+
+  const checkSql = "SELECT * FROM users WHERE email = ?";
+  con.query(checkSql, [email], async (err, result) => {
+    if (err) return res.status(500).json({ message: "Database error" });
+    if (result.length > 0) {
+      return res.status(409).json({ message: "Email already registered" });
+    }
+
+    try {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const insertSql = `
+        INSERT INTO users (first_name, last_name, email, password, role)
+        VALUES (?, ?, ?, ?, ?)
+      `;
+      con.query(
+        insertSql,
+        [first_name, last_name, email, hashedPassword, role || "student"],
+        (err, result) => {
+          if (err)
+            return res.status(500).json({ message: "Error registering user" });
+
+          res.status(201).json({
+            message: "User registered successfully",
+            user_id: result.insertId,
+          });
+        }
+      );
+    } catch (err) {
+      console.error("Registration error:", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+});
 
 // ===============================
 // LOGOUT
