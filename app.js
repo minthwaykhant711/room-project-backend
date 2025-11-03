@@ -7,7 +7,7 @@ const path = require("path");
 const cors = require("cors");
 
 // Import DB connection
-const con = require("./config/config"); // make sure you have db.js or config/config.js
+const con = require("./db.js"); // make sure you have db.js or config/config.js
 
 const app = express();
 app.use(express.json());
@@ -70,6 +70,34 @@ app.get("/api/rooms", (req, res) => {
   const sql = "SELECT * FROM room";
   con.query(sql, (err, result) => {
     if (err) return res.status(500).json({ message: "Error fetching rooms" });
+    res.status(200).json(result);
+  });
+});
+
+// ===============================
+// GET ALL TIME SLOTS
+// ===============================
+app.get("/api/timeslots", (req, res) => {
+  const sql = "SELECT * FROM time_slot ORDER BY start_time";
+  con.query(sql, (err, result) => {
+    if (err) return res.status(500).json({ message: "Error fetching time slots" });
+    res.status(200).json(result);
+  });
+});
+
+// ===============================
+// GET BOOKINGS WITH ROOM INFO BY DATE
+// ===============================
+app.get("/api/bookings_by_date", (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ message: "Date is required" });
+  const sql = `
+    SELECT room_id, slot_id, booking_status 
+    FROM booking 
+    WHERE booking_date = ? AND (booking_status = 'Approved' OR booking_status = 'Waiting')
+  `;
+  con.query(sql, [date], (err, result) => {
+    if (err) return res.status(500).json({ message: "Error fetching bookings" });
     res.status(200).json(result);
   });
 });
