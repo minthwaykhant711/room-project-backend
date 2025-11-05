@@ -1,3 +1,4 @@
+// app.js — CommonJS, port 3000, sessions kept for web, header-based auth for mobile
 const express = require("express");
 const mysql = require("mysql2");
 const session = require("express-session");
@@ -5,24 +6,24 @@ const multer = require("multer");
 const path = require("path");
 const cors = require("cors");
 const argon2 = require("argon2");
-const con = require("./config/config");
+const con = require("./config/config"); // your MySQL connection
 
 const app = express();
 
 // ---------- core middleware ----------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cors()); // if you later need cookies from mobile, switch to: cors({ origin: true, credentials: true })
+app.use(cors()); // keep simple; web can still use cookies locally
 
-// ---------- sessions ----------
+// ---------- sessions (for the web app) ----------
 app.use(
   session({
-    secret: "room_project_secret", // keep it hardcoded per your preference
+    secret: "room_project_secret",
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     },
   })
 );
@@ -30,7 +31,7 @@ app.use(
 // ---------- static image hosting ----------
 const PUBLIC_BASE = "http://localhost:3000";
 const uploadsDir = path.join(__dirname, "uploads");
-app.use("/uploads", express.static(uploadsDir)); // -> http://localhost:3000/uploads/<filename>
+app.use("/uploads", express.static(uploadsDir));
 
 // ---------- tiny helper: promisified query ----------
 function q(sql, params = []) {
@@ -39,11 +40,48 @@ function q(sql, params = []) {
   });
 }
 
+// ---------- auth helper (session OR header override) ----------
+async function attachUserFromAuth(req, _res, next) {
+  if (req.session && req.session.user) return next();
+
+  let raw = req.headers["x-user-id"];
+  if (!raw && req.headers.authorization) {
+    const parts = req.headers.authorization.split(" ");
+    if (parts.length === 2 && /^Bearer$/i.test(parts[0])) raw = parts[1];
+  }
+
+  if (raw) {
+    const id = parseInt(String(raw), 10);
+    if (!Number.isNaN(id)) {
+      try {
+        const rows = await q(
+          "SELECT user_id, email, first_name, last_name, role FROM users WHERE user_id = ? LIMIT 1",
+          [id]
+        );
+        if (rows.length) {
+          const u = rows[0];
+          req.session.user = {
+            id: u.user_id,
+            email: u.email,
+            role: u.role,
+            first_name: u.first_name,
+            last_name: u.last_name,
+            name: `${u.first_name}${u.last_name ? " " + u.last_name : ""}`,
+          };
+        }
+      } catch (e) {
+        console.error("attachUserFromAuth error:", e);
+      }
+    }
+  }
+  next();
+}
+app.use(attachUserFromAuth);
+
 // ============================================================================
 // AUTH
 // ============================================================================
 
-// GET /password/:raw   -> utility to generate Argon2 hash (teacher-style)
 app.get("/password/:raw", async (req, res) => {
   const raw = req.params.raw || "";
   if (!raw) return res.status(400).send("Password required");
@@ -51,7 +89,7 @@ app.get("/password/:raw", async (req, res) => {
     const hash = await argon2.hash(raw, {
       type: argon2.argon2id,
       timeCost: 3,
-      memoryCost: 1 << 16, // 64 MB
+      memoryCost: 1 << 16,
       parallelism: 1,
       hashLength: 32,
       saltLength: 16,
@@ -69,7 +107,6 @@ app.post("/login", (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: "email and password required" });
   }
-
   const sql = `
     SELECT user_id, email, password, first_name, last_name, role
     FROM users
@@ -92,7 +129,6 @@ app.post("/login", (req, res) => {
       return res.status(500).json({ error: "Verification failed" });
     }
 
-    // store full profile in session for inner pages
     req.session.user = {
       id: u.user_id,
       email: u.email,
@@ -101,12 +137,15 @@ app.post("/login", (req, res) => {
       last_name: u.last_name,
       name: `${u.first_name}${u.last_name ? " " + u.last_name : ""}`,
     };
-
-    return res.json({ ok: true, user: req.session.user });
+    return res.json({
+      ok: true,
+      user: req.session.user,
+      mobile_token: String(u.user_id),
+    });
   });
 });
 
-// GET /me  -> returns session user if logged in
+// GET /me
 app.get("/me", (req, res) => {
   if (!req.session || !req.session.user) {
     return res.status(401).json({ error: "Not logged in" });
@@ -115,8 +154,6 @@ app.get("/me", (req, res) => {
 });
 
 // POST /register/create
-// Option A: send { email, password, first_name, last_name?, role? }  -> server hashes
-// Option B: send { email, password_hash, first_name, last_name?, role? } -> stored as-is
 app.post("/register/create", async (req, res) => {
   const {
     email,
@@ -163,7 +200,11 @@ app.post("/register/create", async (req, res) => {
       name: `${first_name}${last_name ? " " + last_name : ""}`,
     };
 
-    return res.status(201).json({ ok: true, user: req.session.user });
+    return res.status(201).json({
+      ok: true,
+      user: req.session.user,
+      mobile_token: String(result.insertId),
+    });
   } catch (e) {
     console.error("register error:", e);
     return res.status(500).json({ error: "Database error" });
@@ -176,7 +217,7 @@ app.get("/logout", (req, res) => {
 });
 
 // ============================================================================
-// ROOMS  (no location column; image served via /uploads; DB stores filename only)
+// ROOMS
 // ============================================================================
 
 // GET /rooms?available=1
@@ -195,6 +236,7 @@ app.get("/rooms", async (req, res) => {
       id: r.room_id,
       name: r.room_name,
       status: r.room_status === 1 ? "available" : "unavailable",
+      disabled: r.room_status !== 1, // <-- include disabled flag here too
       description: r.description,
       image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
     }));
@@ -205,7 +247,7 @@ app.get("/rooms", async (req, res) => {
   }
 });
 
-// OPTIONAL: POST /rooms/:id/image  (admin/staff) — uploads a new image file, saves filename in DB
+// OPTIONAL: POST /rooms/:id/image  (admin/staff)
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
@@ -236,7 +278,6 @@ app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
 // TIME SLOTS
 // ============================================================================
 
-// GET /time-slots
 app.get("/time-slots", async (_req, res) => {
   try {
     const rows = await q(
@@ -250,10 +291,100 @@ app.get("/time-slots", async (_req, res) => {
 });
 
 // ============================================================================
-// BOOKINGS (student/lecturer can create; relies on session user)
+// AVAILABILITY for a day
+// ============================================================================
+//
+// GET /rooms/availability?date=YYYY-MM-DD
+// returns { ok, date, slots:[{slot_id,start_time,end_time}], rooms:[{id,name,description,image_url,disabled,statuses:{'HH:MM - HH:MM': 'available|pending|reserved|passed|disabled'}}] }
+app.get("/rooms/availability", async (req, res) => {
+  try {
+    const ymd = String(req.query.date || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    }
+
+    const rooms = await q(
+      "SELECT room_id, room_name, room_status, description, image FROM room ORDER BY room_name"
+    );
+    const slots = await q("SELECT slot_id, start_time, end_time FROM time_slot ORDER BY slot_id");
+
+    // bookings for that day (Waiting/Approved block the slot)
+    const books = await q(
+      `
+        SELECT b.room_id, b.slot_id, b.booking_status
+        FROM booking b
+        WHERE b.booking_date = ?
+          AND b.booking_status IN ('Waiting','Approved')
+      `,
+      [ymd]
+    );
+
+    const byRoomSlot = new Map();
+    for (const b of books) {
+      if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
+      const map = byRoomSlot.get(b.room_id);
+      map.set(b.slot_id, b.booking_status === "Waiting" ? "pending" : "reserved");
+    }
+
+    // compute "passed" for today
+    const now = new Date();
+    const nowHHMM = now.toTimeString().slice(0, 5);
+    const todayYMD = new Date().toISOString().slice(0, 10);
+    const isToday = ymd === todayYMD;
+
+    const slotLabels = slots.map((s) => {
+      const st = String(s.start_time).slice(0, 5);
+      const et = String(s.end_time).slice(0, 5);
+      return { id: s.slot_id, label: `${st} - ${et}`, start: st };
+    });
+
+    const outRooms = rooms.map((r) => {
+      const roomDisabled = r.room_status !== 1; // 0 => disabled
+      const statuses = {};
+      for (const s of slotLabels) {
+        let status = "available";
+        if (roomDisabled) {
+          status = "disabled"; // whole-room disabled → all slots show disabled
+        } else {
+          const slotMap = byRoomSlot.get(r.room_id);
+          if (slotMap && slotMap.has(s.id)) {
+            status = slotMap.get(s.id); // pending|reserved
+          } else if (isToday && nowHHMM >= s.start) {
+            status = "passed";          // already started today
+          }
+        }
+        statuses[s.label] = status;
+      }
+      return {
+        id: r.room_id,
+        name: r.room_name,
+        description: r.description,
+        image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
+        disabled: roomDisabled, // <-- explicit flag for the frontend to pick overlay message
+        statuses,
+      };
+    });
+
+    res.json({
+      ok: true,
+      date: ymd,
+      slots: slots.map((s) => ({
+        slot_id: s.slot_id,
+        start_time: String(s.start_time).slice(0, 5),
+        end_time: String(s.end_time).slice(0, 5),
+      })),
+      rooms: outRooms,
+    });
+  } catch (e) {
+    console.error("availability error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ============================================================================
+// BOOKINGS
 // ============================================================================
 
-// POST /bookings  { room_id, slot_id, booking_date:'YYYY-MM-DD', objective }
 app.post("/bookings", async (req, res) => {
   try {
     if (!req.session || !req.session.user) {
@@ -269,38 +400,28 @@ app.post("/bookings", async (req, res) => {
       return res.status(400).json({ error: "room_id, slot_id, booking_date required" });
     }
 
-    // Bangkok local date (UTC+7)
-    const tzOffsetMin = 7 * 60;
-    const nowLocal = new Date(new Date().getTime() + tzOffsetMin * 60000);
-    const ymdToday = nowLocal.toISOString().slice(0, 10);
-    if (booking_date < ymdToday) {
-      return res.status(400).json({ error: "Cannot book in the past" });
-    }
-
-    // validate slot
     const slots = await q(
-      "SELECT slot_id, start_time, end_time FROM time_slot WHERE slot_id = ?",
+      "SELECT slot_id, start_time FROM time_slot WHERE slot_id = ?",
       [slot_id]
     );
     if (!slots.length) return res.status(400).json({ error: "Invalid slot" });
 
-    // if booking today, ensure slot not started
-    if (booking_date === ymdToday) {
-      const nowHHMM = nowLocal.toISOString().slice(11, 16); // approx local HH:MM
-      const slotStart = String(slots[0].start_time).slice(0, 5);
-      if (nowHHMM >= slotStart) {
-        return res.status(400).json({ error: "This time slot has already started today" });
-      }
+    const ymdToday = new Date().toISOString().slice(0, 10);
+    const nowHHMM = new Date().toTimeString().slice(0, 5);
+    const slotStart = String(slots[0].start_time).slice(0, 5);
+    if (booking_date < ymdToday) {
+      return res.status(400).json({ error: "Cannot book in the past" });
+    }
+    if (booking_date === ymdToday && nowHHMM >= slotStart) {
+      return res.status(400).json({ error: "This time slot has already started today" });
     }
 
-    // room exists & available?
     const r = await q("SELECT room_status FROM room WHERE room_id = ?", [room_id]);
     if (!r.length) return res.status(404).json({ error: "Room not found" });
     if (r[0].room_status !== 1) {
       return res.status(409).json({ error: "Room is not available" });
     }
 
-    // prevent double booking (room+date+slot) in Waiting/Approved
     const conflict = await q(
       `
       SELECT booking_id FROM booking
@@ -314,7 +435,6 @@ app.post("/bookings", async (req, res) => {
       return res.status(409).json({ error: "Time slot already booked for this room" });
     }
 
-    // one active booking per day per user
     const myDay = await q(
       `
       SELECT booking_id FROM booking
@@ -328,7 +448,6 @@ app.post("/bookings", async (req, res) => {
       return res.status(409).json({ error: "You already have an active booking for this day" });
     }
 
-    // insert as Waiting
     const ins = await q(
       `
       INSERT INTO booking(user_id, room_id, slot_id, booking_date, Objective, booking_status, created_time)
@@ -352,26 +471,70 @@ app.get("/bookings/mine", async (req, res) => {
     }
     const me = req.session.user;
 
+    // NOTE:
+    // - LEFT JOIN users u ON u.user_id = b.approver_id  -> name of approver
+    // - include b.reason                               -> lecturer's rejection reason
+    // - frontend expects `approver_name` and `reject_reason`
     const rows = await q(
       `
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.Objective,
-             r.room_id, r.room_name,
-             t.slot_id, t.start_time, t.end_time
+      SELECT
+        b.booking_id,
+        b.booking_date,
+        b.booking_status,           -- Waiting | Approved | Rejected
+        b.Objective,
+        b.reason,                   -- lecturer's reason on Rejected (nullable)
+        b.approver_id,              -- who approved/rejected (nullable when Waiting)
+
+        r.room_id,
+        r.room_name,
+
+        t.slot_id,
+        t.start_time,
+        t.end_time,
+
+        u.first_name  AS approver_first,
+        u.last_name   AS approver_last
       FROM booking b
-      JOIN room r     ON r.room_id = b.room_id
+      JOIN room r      ON r.room_id = b.room_id
       JOIN time_slot t ON t.slot_id = b.slot_id
+      LEFT JOIN users u ON u.user_id = b.approver_id
       WHERE b.user_id = ?
       ORDER BY b.booking_date DESC, t.slot_id ASC
-    `,
+      `,
       [me.id]
     );
 
-    res.json({ ok: true, bookings: rows });
+    // adapt to what the mobile UI expects
+    const bookings = rows.map((b) => {
+      const approverName =
+        (b.approver_first ? String(b.approver_first) : "") +
+        (b.approver_last ? " " + String(b.approver_last) : "");
+      return {
+        booking_id: b.booking_id,
+        booking_date: b.booking_date,
+        booking_status: b.booking_status, // Waiting | Approved | Rejected
+        Objective: b.Objective,
+
+        // 👇 keys your Flutter page reads:
+        approver_name: approverName.trim(),           // "" when Waiting
+        reject_reason: b.reason ? String(b.reason) : "",
+
+        room_id: b.room_id,
+        room_name: b.room_name,
+
+        slot_id: b.slot_id,
+        start_time: String(b.start_time).slice(0, 5),
+        end_time: String(b.end_time).slice(0, 5),
+      };
+    });
+
+    res.json({ ok: true, bookings });
   } catch (e) {
     console.error("bookings mine error:", e);
     res.status(500).json({ error: "Database error" });
   }
 });
+
 
 // ============================================================================
 // START SERVER
