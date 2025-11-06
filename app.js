@@ -2,6 +2,11 @@ const express = require("express");
 const mysql = require("mysql2");
 const argon2 = require('@node-rs/argon2');
 const con = require('./db');
+// add this helper so routes can use `await q(sql, params)`
+const q = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    con.query(sql, params, (err, results) => (err ? reject(err) : resolve(results)));
+  });
 const session = require("express-session");
 const multer = require("multer");
 const path = require("path");
@@ -65,6 +70,65 @@ app.post("/api/login", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Server error" });
+  }
+});
+
+//register
+// POST /register/create
+app.post("/register/create", async (req, res) => {
+  const {
+    email,
+    password,
+    password_hash,
+    first_name,
+    last_name = "",
+    role = "student",
+  } = req.body || {};
+
+  if (!email || !first_name || (!password && !password_hash)) {
+    return res
+      .status(400)
+      .json({ error: "email, first_name and password or password_hash required" });
+  }
+
+  try {
+    const dup = await q("SELECT user_id FROM users WHERE email = ? LIMIT 1", [email]);
+    if (dup.length) return res.status(409).json({ error: "Email already registered" });
+
+    let toStore = password_hash;
+    if (!toStore) {
+      toStore = await argon2.hash(password, {
+        type: argon2.argon2id,
+        timeCost: 3,
+        memoryCost: 1 << 16,
+        parallelism: 1,
+        hashLength: 32,
+        saltLength: 16,
+      });
+    }
+
+    const result = await q(
+      "INSERT INTO users(email, password, first_name, last_name, role) VALUES (?,?,?,?,?)",
+      [email, toStore, first_name, last_name, role]
+    );
+
+    req.session.user = {
+      id: result.insertId,
+      email,
+      role,
+      first_name,
+      last_name,
+      name: `${first_name}${last_name ? " " + last_name : ""}`,
+    };
+
+    return res.status(201).json({
+      ok: true,
+      user: req.session.user,
+      mobile_token: String(result.insertId),
+    });
+  } catch (e) {
+    console.error("register error:", e);
+    return res.status(500).json({ error: "Database error" });
   }
 });
 
@@ -133,26 +197,26 @@ app.get("/api/bookings_by_date", (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ message: "Date is required" });
 
-  // return booked slots (Pending/Approved) and include slot start_time
   const sql = `
     SELECT b.room_id, b.slot_id, b.booking_status, b.user_id, t.start_time
     FROM booking b
     JOIN time_slot t ON b.slot_id = t.slot_id
     WHERE b.booking_date = ? AND b.booking_status IN ('Pending','Approved')
   `;
-  con.query(sql, [date], (err, rows) => {
-    if (err) return res.status(500).json({ message: "Error fetching bookings" });
 
-    // Attach disabled flag only for today's date (client can also compute)
+  con.query(sql, [date], (err, rows) => {
+    if (err) {
+      console.error("Error fetching bookings_by_date:", err);
+      return res.status(500).json({ message: "Error fetching bookings" });
+    }
+
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const now = new Date();
 
     const result = rows.map(r => {
       let disabled = false;
-      if (date === today) {
-        // r.start_time expected as "HH:MM:SS" — build a Date using today's date
+      if (date === today && r.start_time) {
         const slotDateTime = new Date(`${date}T${r.start_time}`);
-        // if slot start <= now then it's disabled for booking
         if (slotDateTime <= now) disabled = true;
       }
       return {
@@ -264,25 +328,7 @@ app.post("/api/book", (req, res) => {
   });
 });
 
-// // ===============================
-// // APPROVE / REJECT BOOKING (for staff or lecturer)
-// // ===============================
-// app.post("/api/booking/decision", (req, res) => {
-//   const { booking_id, approver_id, status } = req.body;
 
-//   if (!booking_id || !approver_id || !status)
-//     return res.status(400).json({ message: "Missing required fields" });
-
-//   const sql = `
-//     UPDATE booking
-//     SET booking_status = ?, approver_id = ?
-//     WHERE booking_id = ?
-//   `;
-//   con.query(sql, [status, approver_id, booking_id], (err, result) => {
-//     if (err) return res.status(500).json({ message: "Error updating booking" });
-//     res.status(200).json({ message: `Booking ${status}` });
-//   });
-// });
 
 
 
