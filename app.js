@@ -535,6 +535,251 @@ app.get("/bookings/mine", async (req, res) => {
   }
 });
 
+// ===== Lecturer Dashboard: Room Status Summary =====
+app.get('/api/rooms/status-summary', async (req, res) => {
+  try {
+    // accept optional ?date=YYYY-MM-DD, fallback to server today
+    const qDate = String(req.query.date || '').slice(0, 10);
+    const ymd = /^\d{4}-\d{2}-\d{2}$/.test(qDate)
+      ? qDate
+      : new Date().toISOString().slice(0, 10);
+
+    // avoid intermediate caches returning stale counts
+    res.set('Cache-Control', 'no-store');
+
+    // load rooms, slots and bookings for the requested date (Waiting/Approved)
+    const rooms = await q(
+      "SELECT room_id, room_name, room_status, description, image FROM room ORDER BY room_name"
+    );
+    const slots = await q("SELECT slot_id, start_time, end_time FROM time_slot ORDER BY slot_id");
+    const books = await q(
+      `
+        SELECT b.room_id, b.slot_id, b.booking_status
+        FROM booking b
+        WHERE b.booking_date = ?
+          AND b.booking_status IN ('Waiting','Approved')
+      `,
+      [ymd]
+    );
+
+    // map bookings per room -> slot -> ('pending'|'reserved')
+    const byRoomSlot = new Map();
+    for (const b of books) {
+      if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
+      byRoomSlot.get(b.room_id).set(b.slot_id, b.booking_status === 'Waiting' ? 'pending' : 'reserved');
+    }
+
+    // helpers for slot labels and current time check
+    const slotLabels = slots.map((s) => {
+      const st = String(s.start_time).slice(0, 5);
+      const et = String(s.end_time).slice(0, 5);
+      return { id: s.slot_id, label: `${st} - ${et}`, start: st };
+    });
+
+    const now = new Date();
+    const nowHHMM = now.toTimeString().slice(0, 5);
+    const todayYMD = new Date().toISOString().slice(0, 10);
+    const isToday = ymd === todayYMD;
+
+    // per-slot (room * slot) entries and counts
+    const summary = { available: 0, pending: 0, reserved: 0, disabled: 0, passed: 0 };
+    const groups = { available: [], pending: [], reserved: [], disabled: [], passed: [] };
+    const entries = []; // each timeslot = one entry
+
+    for (const r of rooms) {
+      const roomDisabled = r.room_status !== 1;
+      for (const s of slotLabels) {
+        let status = 'available';
+        if (roomDisabled) {
+          status = 'disabled';
+        } else {
+          const slotMap = byRoomSlot.get(r.room_id);
+          if (slotMap && slotMap.has(s.id)) {
+            status = slotMap.get(s.id); // pending|reserved
+          } else if (isToday && nowHHMM >= s.start) {
+            status = 'passed';
+          }
+        }
+
+        // count and group by status
+        if (!Object.prototype.hasOwnProperty.call(summary, status)) {
+          summary[status] = 0;
+          groups[status] = [];
+        }
+        summary[status] += 1;
+
+        const item = {
+          room_id: r.room_id,
+          room_name: r.room_name,
+          slot_id: s.id,
+          slot_label: s.label,
+          status,
+          description: r.description,
+          image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
+        };
+        groups[status].push(item);
+        entries.push(item);
+      }
+    }
+
+    res.json({
+      ok: true,
+      date: ymd,
+      total_rooms: rooms.length,
+      total_slots: rooms.length * slotLabels.length,
+      summary,
+      groups,
+      entries, // frontend can use this for per-timeslot UI
+    });
+  } catch (err) {
+    console.error('status-summary error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Lecturer endpoints: pending list, lecturer's history, approve & reject
+// ---------------------------------------------------------------------------
+
+// GET /bookings/pending?date=YYYY-MM-DD
+// Returns bookings with booking_status = 'Waiting' for the given date
+app.get('/bookings/pending', async (req, res) => {
+  try {
+    const ymd = String(req.query.date || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      return res.status(400).json({ error: 'date (YYYY-MM-DD) required' });
+    }
+
+    const rows = await q(
+      `
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.Objective,
+             r.room_id, r.room_name,
+             t.slot_id, t.start_time, t.end_time,
+             u.user_id, u.first_name, u.last_name
+      FROM booking b
+      JOIN room r ON r.room_id = b.room_id
+      JOIN time_slot t ON t.slot_id = b.slot_id
+      JOIN users u ON u.user_id = b.user_id
+      WHERE b.booking_date = ? AND b.booking_status = 'Waiting'
+      ORDER BY t.slot_id ASC
+    `,
+      [ymd]
+    );
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: b.booking_status,
+      objective: b.Objective,
+      room_id: b.room_id,
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      user_id: b.user_id,
+      booked_by: ((b.first_name || '') + (b.last_name ? ' ' + b.last_name : '')).trim(),
+    }));
+
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error('bookings pending error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// GET /bookings/for-lecturer
+// Returns bookings that were approved/rejected by the current lecturer (approver_id)
+app.get('/bookings/for-lecturer', async (req, res) => {
+  try {
+    if (!req.session || !req.session.user) return res.status(401).json({ error: 'Not logged in' });
+    const me = req.session.user;
+
+    const rows = await q(
+      `
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.Objective, b.reason, b.approver_id,
+             r.room_id, r.room_name,
+             t.slot_id, t.start_time, t.end_time,
+             u.user_id AS booked_user_id, u.first_name AS booked_first, u.last_name AS booked_last
+      FROM booking b
+      JOIN room r ON r.room_id = b.room_id
+      JOIN time_slot t ON t.slot_id = b.slot_id
+      JOIN users u ON u.user_id = b.user_id
+      WHERE b.approver_id = ?
+      ORDER BY b.booking_date DESC, t.slot_id ASC
+    `,
+      [me.id]
+    );
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: b.booking_status,
+      objective: b.Objective,
+      reason: b.reason || '',
+      approver_id: b.approver_id,
+      room_id: b.room_id,
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      booked_by: ((b.booked_first || '') + (b.booked_last ? ' ' + b.booked_last : '')).trim(),
+    }));
+
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error('bookings for-lecturer error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// POST /bookings/:id/approve
+app.post('/bookings/:id/approve', async (req, res) => {
+  try {
+    if (!req.session || !req.session.user) return res.status(401).json({ error: 'Not logged in' });
+    const me = req.session.user;
+
+    const id = parseInt(String(req.params.id), 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid booking id' });
+
+    const rows = await q('SELECT booking_id FROM booking WHERE booking_id = ? LIMIT 1', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Booking not found' });
+
+    await q('UPDATE booking SET booking_status = ?, approver_id = ?, reason = NULL WHERE booking_id = ?', [
+      'Approved', me.id, id,
+    ]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('approve booking error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// POST /bookings/:id/reject  { reason }
+app.post('/bookings/:id/reject', async (req, res) => {
+  try {
+    if (!req.session || !req.session.user) return res.status(401).json({ error: 'Not logged in' });
+    const me = req.session.user;
+    const id = parseInt(String(req.params.id), 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid booking id' });
+    const reason = String(req.body.reason || '').trim();
+
+    const rows = await q('SELECT booking_id FROM booking WHERE booking_id = ? LIMIT 1', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Booking not found' });
+
+    await q('UPDATE booking SET booking_status = ?, approver_id = ?, reason = ? WHERE booking_id = ?', [
+      'Rejected', me.id, reason, id,
+    ]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('reject booking error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+
 
 // ============================================================================
 // START SERVER
