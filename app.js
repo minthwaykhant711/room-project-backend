@@ -391,8 +391,8 @@ app.post("/bookings", async (req, res) => {
       return res.status(401).json({ error: "Not logged in" });
     }
     const me = req.session.user;
-    if (me.role !== "student" && me.role !== "lecturer") {
-      return res.status(403).json({ error: "Only students/lecturers can book" });
+    if (me.role !== "student") {
+      return res.status(403).json({ error: "Only students book" });
     }
 
     const { room_id, slot_id, booking_date, objective = "" } = req.body || {};
