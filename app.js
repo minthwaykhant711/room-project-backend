@@ -22,7 +22,6 @@ app.use(cors()); // mobile uses Authorization header; this is fine
 const uploadsDir = path.join(__dirname, "uploads");
 app.use("/uploads", express.static(uploadsDir));
 
-
 function q(sql, params = []) {
   return new Promise((resolve, reject) => {
     con.query(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
@@ -67,8 +66,8 @@ function requireAuth(req, res, next) {
 // ============================================================================
 // AUTH
 // ============================================================================
-
 // GET /password/:raw   -> dev utility to generate Argon2 hash
+
 app.get("/password/:raw", async (req, res) => {
   const raw = req.params.raw || "";
   if (!raw) return res.status(400).send("Password required");
@@ -363,6 +362,7 @@ app.get("/rooms/availability", async (req, res) => {
         name: r.room_name,
         description: r.description,
         image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
+        room_status: r.room_status,   
         statuses,
       };
     });
@@ -391,10 +391,6 @@ app.get("/rooms/availability", async (req, res) => {
 app.post("/bookings", requireAuth, async (req, res) => {
   try {
     const me = req.user;
-    if (me.role !== "student" && me.role !== "lecturer") {
-      return res.status(403).json({ error: "Only students/lecturers can book" });
-    }
-
     const { room_id, slot_id, booking_date, objective = "" } = req.body || {};
     if (!room_id || !slot_id || !booking_date) {
       return res.status(400).json({ error: "room_id, slot_id, booking_date required" });
