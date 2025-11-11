@@ -23,6 +23,17 @@ app.use(cors());
 const uploadsDir = path.join(__dirname, "uploads");
 app.use("/uploads", express.static(uploadsDir));
 
+// POST /rooms/:id/image  (staff)
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "");
+    const base = Date.now().toString(36) + Math.random().toString(16).slice(2);
+    cb(null, base + ext.toLowerCase());
+  },
+});
+const upload = multer({ storage });
+
 // ---------- helpers ----------
 function q(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -93,7 +104,7 @@ app.get("/password/:raw", async (req, res) => {
 });
 
 // POST /login   { email, password }
-app.post("/login", (req, res) => {
+app.post("/api/login", (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ error: "email and password required" });
@@ -135,7 +146,7 @@ app.post("/login", (req, res) => {
 });
 
 // POST /register/create
-app.post("/register/create", async (req, res) => {
+app.post("/api/register/create", async (req, res) => {
   const {
     email,
     password,
@@ -199,8 +210,8 @@ app.post("/register/create", async (req, res) => {
   }
 });
 
-// GET /me
-app.get("/me", requireAuth, async (req, res) => {
+// GET /user_auth_jwt_web_token
+app.get("/common/user_auth", requireAuth, async (req, res) => {
   try {
     const rows = await q(
       "SELECT user_id, email, first_name, last_name, role FROM users WHERE user_id = ? LIMIT 1",
@@ -225,66 +236,6 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 // ============================================================================
-// ROOMS (basic)
-// ============================================================================
-app.get("/rooms", async (req, res) => {
-  try {
-    const onlyAvailable = String(req.query.available || "") === "1";
-    const rows = await q(
-      `
-      SELECT room_id, room_name, room_status, description, image
-      FROM room
-      ${onlyAvailable ? "WHERE room_status = 1" : ""}
-      ORDER BY room_name
-    `
-    );
-    const rooms = rows.map((r) => ({
-      id: r.room_id,
-      name: r.room_name,
-      status: r.room_status === 1 ? "available" : "unavailable",
-      description: r.description,
-      image_url: r.image
-        ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}`
-        : null,
-    }));
-    res.json({ ok: true, rooms });
-  } catch (e) {
-    console.error("rooms error:", e);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-// OPTIONAL: POST /rooms/:id/image  (admin/staff)
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || "");
-    const base = Date.now().toString(36) + Math.random().toString(16).slice(2);
-    cb(null, base + ext.toLowerCase());
-  },
-});
-const upload = multer({ storage });
-
-app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!req.file) return res.status(400).send("No file uploaded");
-    await q("UPDATE room SET image = ? WHERE room_id = ?", [
-      req.file.filename,
-      id,
-    ]);
-    res.json({
-      ok: true,
-      filename: req.file.filename,
-      url: `${PUBLIC_BASE}/uploads/${req.file.filename}`,
-    });
-  } catch (e) {
-    console.error("upload error:", e);
-    res.status(500).send("Upload failed");
-  }
-});
-
-// ============================================================================
 // TIME SLOTS
 // ============================================================================
 app.get("/time-slots", async (_req, res) => {
@@ -299,13 +250,9 @@ app.get("/time-slots", async (_req, res) => {
   }
 });
 
-// ============================================================================
-// AVAILABILITY for a day
-// ============================================================================
-//
 // GET /rooms/availability?date=YYYY-MM-DD
 // returns { ok, date, slots:[{slot_id,start_time,end_time}], rooms:[{id,name,description,image_url,room_status,statuses:{'HH:MM - HH:MM': 'available|pending|reserved|passed|disabled'}}] }
-app.get("/rooms/availability", async (req, res) => {
+app.get("/common/rooms/availability", async (req, res) => {
   try {
     const ymd = String(req.query.date || "").slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
@@ -394,7 +341,7 @@ app.get("/rooms/availability", async (req, res) => {
 // ============================================================================
 // BOOKINGS (student can create; JWT auth)
 // ============================================================================
-app.post("/bookings", requireAuth, async (req, res) => {
+app.post("/student/bookings", requireAuth, async (req, res) => {
   try {
     const me = req.user;
     const { room_id, slot_id, booking_date, objective = "" } = req.body || {};
@@ -474,7 +421,7 @@ app.post("/bookings", requireAuth, async (req, res) => {
 });
 
 // GET /bookings/mine (student)
-app.get("/bookings/mine", requireAuth, async (req, res) => {
+app.get("/student/bookings/history", requireAuth, async (req, res) => {
   try {
     const me = req.user;
 
@@ -490,7 +437,7 @@ app.get("/bookings/mine", requireAuth, async (req, res) => {
       JOIN time_slot t  ON t.slot_id = b.slot_id
       LEFT JOIN users u2 ON u2.user_id = b.approver_id
       WHERE b.user_id = ?
-      ORDER BY b.booking_date DESC, t.slot_id ASC
+      ORDER BY b.booking_id DESC
     `,
       [me.id]
     );
@@ -524,7 +471,7 @@ app.get("/bookings/mine", requireAuth, async (req, res) => {
 // ============================================================================
 
 // helper to ensure lecturer-like roles
-const ensureLecturer = [requireAuth, requireRole("lecturer", "staff", "admin")];
+const ensureLecturer = [requireAuth, requireRole("lecturer", "staff")];
 
 // GET /lecturer/bookings/pending
 app.get("/lecturer/bookings/pending", ensureLecturer, async (req, res) => {
@@ -541,7 +488,7 @@ app.get("/lecturer/bookings/pending", ensureLecturer, async (req, res) => {
       JOIN time_slot t ON t.slot_id = b.slot_id
       JOIN users u     ON u.user_id = b.user_id
       WHERE b.booking_status = 'Waiting'
-      ORDER BY b.booking_date DESC, t.slot_id DESC
+      ORDER BY b.booking_id DESC
     `
     );
 
@@ -584,7 +531,8 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
       JOIN users a      ON a.user_id = b.approver_id
       WHERE b.approver_id = ?
         AND b.booking_status IN ('Approved','Rejected')
-      ORDER BY b.booking_date DESC, t.slot_id DESC
+
+      ORDER BY b.booking_id DESC
     `,
       [req.user.id]
     );
@@ -611,11 +559,11 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
     console.error("lecturer history error:", e);
     res.status(500).json({ error: "Database error" });
   }
+  
 });
 
 // POST /lecturer/bookings/:id/approve
-app.post(
-  "/lecturer/bookings/:id/approve",
+app.post("/lecturer/bookings/:id/approve",
   ensureLecturer,
   async (req, res) => {
     try {
@@ -680,74 +628,22 @@ app.post("/lecturer/bookings/:id/reject", ensureLecturer, async (req, res) => {
   }
 });
 
-// GET /lecturer/summary?date=YYYY-MM-DD
-// Returns slot-level counts for dashboard: {available, pending, reserved, disabled}
-app.get("/lecturer/summary", ensureLecturer, async (req, res) => {
+app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
   try {
-    const ymd = String(req.query.date || "").slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
-      return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
-    }
-
-    const rooms = await q(
-      "SELECT room_id, room_status FROM room"
-    );
-    const slots = await q("SELECT slot_id, start_time FROM time_slot ORDER BY slot_id");
-    const books = await q(
-      `
-        SELECT b.room_id, b.slot_id, b.booking_status
-        FROM booking b
-        WHERE b.booking_date = ?
-          AND b.booking_status IN ('Waiting','Approved')
-      `,
-      [ymd]
-    );
-
-    const byRoomSlot = new Map();
-    for (const b of books) {
-      if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
-      byRoomSlot.get(b.room_id).set(
-        b.slot_id,
-        b.booking_status === "Waiting" ? "pending" : "reserved"
-      );
-    }
-
-    let available = 0,
-      pending = 0,
-      reserved = 0,
-      disabled = 0;
-
-    const now = new Date();
-    const nowHHMM = now.toTimeString().slice(0, 5);
-    const todayYMD = new Date().toISOString().slice(0, 10);
-    const isToday = ymd === todayYMD;
-
-    for (const r of rooms) {
-      const roomDisabled = r.room_status !== 1;
-      for (const s of slots) {
-        if (roomDisabled) {
-          disabled++;
-          continue;
-        }
-        const st = String(s.start_time).slice(0, 5);
-        const slotMap = byRoomSlot.get(r.room_id);
-        if (slotMap && slotMap.has(s.slot_id)) {
-          const status = slotMap.get(s.slot_id);
-          if (status === "pending") pending++;
-          else reserved++;
-        } else if (isToday && nowHHMM >= st) {
-          // "passed" doesn't contribute to available/pending/reserved; treat as not available
-          // If you want passed to count as unavailable but not disabled, just ignore here.
-        } else {
-          available++;
-        }
-      }
-    }
-
-    res.json({ ok: true, date: ymd, available, pending, reserved, disabled });
+    const id = req.params.id;
+    if (!req.file) return res.status(400).send("No file uploaded");
+    await q("UPDATE room SET image = ? WHERE room_id = ?", [
+      req.file.filename,
+      id,
+    ]);
+    res.json({
+      ok: true,
+      filename: req.file.filename,
+      url: `${PUBLIC_BASE}/uploads/${req.file.filename}`,
+    });
   } catch (e) {
-    console.error("lecturer summary error:", e);
-    res.status(500).json({ error: "Database error" });
+    console.error("upload error:", e);
+    res.status(500).send("Upload failed");
   }
 });
 
