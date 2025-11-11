@@ -7,28 +7,29 @@ const path = require("path");
 const cors = require("cors");
 const argon2 = require("argon2");
 const jwt = require("jsonwebtoken");
-const con = require("./config/config"); 
+const con = require("./config/config");
+
 const app = express();
-const JWT_SECRET = "your_super_secret_change_me"; 
+const JWT_SECRET = "your_super_secret_change_me";
 const PUBLIC_BASE = "http://localhost:3000";
 const PORT = 3000;
 
 // ---------- core middleware ----------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cors()); // mobile uses Authorization header; this is fine
+app.use(cors());
 
 // ---------- static image hosting ----------
 const uploadsDir = path.join(__dirname, "uploads");
 app.use("/uploads", express.static(uploadsDir));
 
+// ---------- helpers ----------
 function q(sql, params = []) {
   return new Promise((resolve, reject) => {
     con.query(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
   });
 }
 function signUser(u) {
-  // keep small, include safe fields for quick /me
   return jwt.sign(
     {
       id: u.user_id,
@@ -42,15 +43,13 @@ function signUser(u) {
   );
 }
 function getAuthUser(req) {
-  // read Authorization: Bearer <jwt>
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
   if (parts.length === 2 && /^Bearer$/i.test(parts[0])) {
     const token = parts[1];
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      return decoded; // {id, email, role, first_name, last_name, iat, exp}
-    } catch (e) {
+      return jwt.verify(token, JWT_SECRET);
+    } catch {
       return null;
     }
   }
@@ -62,12 +61,18 @@ function requireAuth(req, res, next) {
   req.user = user;
   next();
 }
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: "Not logged in" });
+    if (!roles.includes(req.user.role))
+      return res.status(403).json({ error: "Forbidden" });
+    next();
+  };
+}
 
 // ============================================================================
 // AUTH
 // ============================================================================
-// GET /password/:raw   -> dev utility to generate Argon2 hash
-
 app.get("/password/:raw", async (req, res) => {
   const raw = req.params.raw || "";
   if (!raw) return res.status(400).send("Password required");
@@ -116,7 +121,6 @@ app.post("/login", (req, res) => {
       return res.status(500).json({ error: "Verification failed" });
     }
 
-    // sign JWT & return profile like web did before
     const token = signUser(u);
     const userPayload = {
       id: u.user_id,
@@ -129,7 +133,8 @@ app.post("/login", (req, res) => {
     return res.json({ ok: true, user: userPayload, token });
   });
 });
-// POST /register/create  { email, password or password_hash, first_name, last_name?, role? }
+
+// POST /register/create
 app.post("/register/create", async (req, res) => {
   const {
     email,
@@ -147,7 +152,9 @@ app.post("/register/create", async (req, res) => {
   }
 
   try {
-    const dup = await q("SELECT user_id FROM users WHERE email = ? LIMIT 1", [email]);
+    const dup = await q("SELECT user_id FROM users WHERE email = ? LIMIT 1", [
+      email,
+    ]);
     if (dup.length) return res.status(409).json({ error: "Email already registered" });
 
     let toStore = password_hash;
@@ -192,10 +199,9 @@ app.post("/register/create", async (req, res) => {
   }
 });
 
-// GET /me  -> decode JWT and (optionally) refresh from DB
+// GET /me
 app.get("/me", requireAuth, async (req, res) => {
   try {
-    // If you want to be 100% fresh:
     const rows = await q(
       "SELECT user_id, email, first_name, last_name, role FROM users WHERE user_id = ? LIMIT 1",
       [req.user.id]
@@ -218,6 +224,9 @@ app.get("/me", requireAuth, async (req, res) => {
   }
 });
 
+// ============================================================================
+// ROOMS (basic)
+// ============================================================================
 app.get("/rooms", async (req, res) => {
   try {
     const onlyAvailable = String(req.query.available || "") === "1";
@@ -234,7 +243,9 @@ app.get("/rooms", async (req, res) => {
       name: r.room_name,
       status: r.room_status === 1 ? "available" : "unavailable",
       description: r.description,
-      image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
+      image_url: r.image
+        ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}`
+        : null,
     }));
     res.json({ ok: true, rooms });
   } catch (e) {
@@ -258,7 +269,10 @@ app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
   try {
     const id = req.params.id;
     if (!req.file) return res.status(400).send("No file uploaded");
-    await q("UPDATE room SET image = ? WHERE room_id = ?", [req.file.filename, id]);
+    await q("UPDATE room SET image = ? WHERE room_id = ?", [
+      req.file.filename,
+      id,
+    ]);
     res.json({
       ok: true,
       filename: req.file.filename,
@@ -273,8 +287,6 @@ app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
 // ============================================================================
 // TIME SLOTS
 // ============================================================================
-
-// GET /time-slots
 app.get("/time-slots", async (_req, res) => {
   try {
     const rows = await q(
@@ -292,7 +304,7 @@ app.get("/time-slots", async (_req, res) => {
 // ============================================================================
 //
 // GET /rooms/availability?date=YYYY-MM-DD
-// returns { ok, date, slots:[{slot_id,start_time,end_time}], rooms:[{id,name,description,image_url,statuses:{'HH:MM - HH:MM': 'available|pending|reserved|passed|disabled'}}] }
+// returns { ok, date, slots:[{slot_id,start_time,end_time}], rooms:[{id,name,description,image_url,room_status,statuses:{'HH:MM - HH:MM': 'available|pending|reserved|passed|disabled'}}] }
 app.get("/rooms/availability", async (req, res) => {
   try {
     const ymd = String(req.query.date || "").slice(0, 10);
@@ -303,9 +315,10 @@ app.get("/rooms/availability", async (req, res) => {
     const rooms = await q(
       "SELECT room_id, room_name, room_status, description, image FROM room ORDER BY room_name"
     );
-    const slots = await q("SELECT slot_id, start_time, end_time FROM time_slot ORDER BY slot_id");
+    const slots = await q(
+      "SELECT slot_id, start_time, end_time FROM time_slot ORDER BY slot_id"
+    );
 
-    // bookings for that day that actually block a slot
     const books = await q(
       `
         SELECT b.room_id, b.slot_id, b.booking_status
@@ -316,18 +329,13 @@ app.get("/rooms/availability", async (req, res) => {
       [ymd]
     );
 
-    // map: roomId -> (slotId -> status)
     const byRoomSlot = new Map();
     for (const b of books) {
       if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
       const map = byRoomSlot.get(b.room_id);
-      map.set(
-        b.slot_id,
-        b.booking_status === "Waiting" ? "pending" : "reserved"
-      );
+      map.set(b.slot_id, b.booking_status === "Waiting" ? "pending" : "reserved");
     }
 
-    // local server time for "passed" marking
     const now = new Date();
     const nowHHMM = now.toTimeString().slice(0, 5);
     const todayYMD = new Date().toISOString().slice(0, 10);
@@ -344,14 +352,12 @@ app.get("/rooms/availability", async (req, res) => {
       for (const s of slotLabels) {
         let status = "available";
         if (r.room_status !== 1) {
-          // room disabled/offline -> every slot shown as disabled
           status = "disabled";
         } else {
           const slotMap = byRoomSlot.get(r.room_id);
           if (slotMap && slotMap.has(s.id)) {
             status = slotMap.get(s.id); // pending|reserved
           } else if (isToday && nowHHMM >= s.start) {
-            // passed slots on the same day: unclickable but NOT disabled
             status = "passed";
           }
         }
@@ -361,8 +367,10 @@ app.get("/rooms/availability", async (req, res) => {
         id: r.room_id,
         name: r.room_name,
         description: r.description,
-        image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : null,
-        room_status: r.room_status,   
+        image_url: r.image
+          ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}`
+          : null,
+        room_status: r.room_status,
         statuses,
       };
     });
@@ -384,26 +392,24 @@ app.get("/rooms/availability", async (req, res) => {
 });
 
 // ============================================================================
-// BOOKINGS (student/lecturer can create; JWT auth)
+// BOOKINGS (student can create; JWT auth)
 // ============================================================================
-
-// POST /bookings  { room_id, slot_id, booking_date:'YYYY-MM-DD', objective }
 app.post("/bookings", requireAuth, async (req, res) => {
   try {
     const me = req.user;
     const { room_id, slot_id, booking_date, objective = "" } = req.body || {};
     if (!room_id || !slot_id || !booking_date) {
-      return res.status(400).json({ error: "room_id, slot_id, booking_date required" });
+      return res
+        .status(400)
+        .json({ error: "room_id, slot_id, booking_date required" });
     }
 
-    // validate slot
     const slots = await q(
       "SELECT slot_id, start_time FROM time_slot WHERE slot_id = ?",
       [slot_id]
     );
     if (!slots.length) return res.status(400).json({ error: "Invalid slot" });
 
-    // Block booking in the past & passed slot (local server time)
     const ymdToday = new Date().toISOString().slice(0, 10);
     const nowHHMM = new Date().toTimeString().slice(0, 5);
     const slotStart = String(slots[0].start_time).slice(0, 5);
@@ -414,14 +420,14 @@ app.post("/bookings", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "This time slot has already started today" });
     }
 
-    // room exists & available?
-    const r = await q("SELECT room_status FROM room WHERE room_id = ?", [room_id]);
+    const r = await q("SELECT room_status FROM room WHERE room_id = ?", [
+      room_id,
+    ]);
     if (!r.length) return res.status(404).json({ error: "Room not found" });
     if (r[0].room_status !== 1) {
       return res.status(409).json({ error: "Room is not available" });
     }
 
-    // prevent double booking (room+date+slot) while Waiting/Approved
     const conflict = await q(
       `
       SELECT booking_id FROM booking
@@ -432,10 +438,11 @@ app.post("/bookings", requireAuth, async (req, res) => {
       [room_id, slot_id, booking_date]
     );
     if (conflict.length) {
-      return res.status(409).json({ error: "Time slot already booked for this room" });
+      return res
+        .status(409)
+        .json({ error: "Time slot already booked for this room" });
     }
 
-    // one active booking per day per user
     const myDay = await q(
       `
       SELECT booking_id FROM booking
@@ -446,10 +453,11 @@ app.post("/bookings", requireAuth, async (req, res) => {
       [me.id, booking_date]
     );
     if (myDay.length) {
-      return res.status(409).json({ error: "You already have an active booking for this day" });
+      return res
+        .status(409)
+        .json({ error: "You already have an active booking for this day" });
     }
 
-    // insert as Waiting
     const ins = await q(
       `
       INSERT INTO booking(user_id, room_id, slot_id, booking_date, Objective, booking_status, created_time)
@@ -465,8 +473,7 @@ app.post("/bookings", requireAuth, async (req, res) => {
   }
 });
 
-// GET /bookings/mine
-// returns each booking incl. approver name & reject reason
+// GET /bookings/mine (student)
 app.get("/bookings/mine", requireAuth, async (req, res) => {
   try {
     const me = req.user;
@@ -495,10 +502,9 @@ app.get("/bookings/mine", requireAuth, async (req, res) => {
       Objective: b.Objective,
       reject_reason: b.reject_reason || "",
       approver_id: b.approver_id,
-      approver_name:
-        b.approver_first
-          ? `${b.approver_first}${b.approver_last ? " " + b.approver_last : ""}`
-          : "",
+      approver_name: b.approver_first
+        ? `${b.approver_first}${b.approver_last ? " " + b.approver_last : ""}`
+        : "",
       room_id: b.room_id,
       room_name: b.room_name,
       slot_id: b.slot_id,
@@ -509,6 +515,238 @@ app.get("/bookings/mine", requireAuth, async (req, res) => {
     res.json({ ok: true, bookings });
   } catch (e) {
     console.error("bookings mine error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ============================================================================
+// LECTURER ENDPOINTS (pending/history/approve/reject/summary)
+// ============================================================================
+
+// helper to ensure lecturer-like roles
+const ensureLecturer = [requireAuth, requireRole("lecturer", "staff", "admin")];
+
+// GET /lecturer/bookings/pending
+app.get("/lecturer/bookings/pending", ensureLecturer, async (req, res) => {
+  try {
+    // All Waiting bookings (no approver yet)
+    const rows = await q(
+      `
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.user_id, b.slot_id,
+             r.room_name,
+             t.start_time, t.end_time,
+             u.first_name AS student_first, u.last_name AS student_last
+      FROM booking b
+      JOIN room r      ON r.room_id = b.room_id
+      JOIN time_slot t ON t.slot_id = b.slot_id
+      JOIN users u     ON u.user_id = b.user_id
+      WHERE b.booking_status = 'Waiting'
+      ORDER BY b.booking_date DESC, t.slot_id DESC
+    `
+    );
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: "Waiting",
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      booked_by_name: `${b.student_first}${
+        b.student_last ? " " + b.student_last : ""
+      }`,
+    }));
+
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error("lecturer pending error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// GET /lecturer/bookings/history
+app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
+  try {
+    // Bookings this lecturer decided (Approved/Rejected)
+    const rows = await q(
+      `
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.reason AS reject_reason,
+             b.slot_id,
+             r.room_name,
+             t.start_time, t.end_time,
+             u.first_name AS student_first, u.last_name AS student_last,
+             a.first_name AS approver_first, a.last_name AS approver_last
+      FROM booking b
+      JOIN room r       ON r.room_id = b.room_id
+      JOIN time_slot t  ON t.slot_id = b.slot_id
+      JOIN users u      ON u.user_id = b.user_id
+      JOIN users a      ON a.user_id = b.approver_id
+      WHERE b.approver_id = ?
+        AND b.booking_status IN ('Approved','Rejected')
+      ORDER BY b.booking_date DESC, t.slot_id DESC
+    `,
+      [req.user.id]
+    );
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: b.booking_status, // Approved | Rejected
+      reject_reason: b.reject_reason || "",
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      booked_by_name: `${b.student_first}${
+        b.student_last ? " " + b.student_last : ""
+      }`,
+      approver_name: `${b.approver_first}${
+        b.approver_last ? " " + b.approver_last : ""
+      }`,
+    }));
+
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error("lecturer history error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// POST /lecturer/bookings/:id/approve
+app.post(
+  "/lecturer/bookings/:id/approve",
+  ensureLecturer,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id) || 0;
+
+      // ensure exists & still Waiting
+      const rows = await q(
+        "SELECT booking_id FROM booking WHERE booking_id = ? AND booking_status = 'Waiting' LIMIT 1",
+        [id]
+      );
+      if (!rows.length)
+        return res.status(404).json({ error: "Booking not found or not Waiting" });
+
+      await q(
+        `
+        UPDATE booking
+        SET booking_status = 'Approved',
+            approver_id = ?,
+            reason = NULL
+        WHERE booking_id = ?
+      `,
+        [req.user.id, id]
+      );
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("approve error:", e);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+// POST /lecturer/bookings/:id/reject {reason}
+app.post("/lecturer/bookings/:id/reject", ensureLecturer, async (req, res) => {
+  try {
+    const id = Number(req.params.id) || 0;
+    const reason = (req.body && req.body.reason ? String(req.body.reason) : "").trim();
+    if (!reason) return res.status(400).json({ error: "Reason required" });
+
+    const rows = await q(
+      "SELECT booking_id FROM booking WHERE booking_id = ? AND booking_status = 'Waiting' LIMIT 1",
+      [id]
+    );
+    if (!rows.length)
+      return res.status(404).json({ error: "Booking not found or not Waiting" });
+
+    await q(
+      `
+      UPDATE booking
+      SET booking_status = 'Rejected',
+          approver_id = ?,
+          reason = ?
+      WHERE booking_id = ?
+    `,
+      [req.user.id, reason, id]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("reject error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// GET /lecturer/summary?date=YYYY-MM-DD
+// Returns slot-level counts for dashboard: {available, pending, reserved, disabled}
+app.get("/lecturer/summary", ensureLecturer, async (req, res) => {
+  try {
+    const ymd = String(req.query.date || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    }
+
+    const rooms = await q(
+      "SELECT room_id, room_status FROM room"
+    );
+    const slots = await q("SELECT slot_id, start_time FROM time_slot ORDER BY slot_id");
+    const books = await q(
+      `
+        SELECT b.room_id, b.slot_id, b.booking_status
+        FROM booking b
+        WHERE b.booking_date = ?
+          AND b.booking_status IN ('Waiting','Approved')
+      `,
+      [ymd]
+    );
+
+    const byRoomSlot = new Map();
+    for (const b of books) {
+      if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
+      byRoomSlot.get(b.room_id).set(
+        b.slot_id,
+        b.booking_status === "Waiting" ? "pending" : "reserved"
+      );
+    }
+
+    let available = 0,
+      pending = 0,
+      reserved = 0,
+      disabled = 0;
+
+    const now = new Date();
+    const nowHHMM = now.toTimeString().slice(0, 5);
+    const todayYMD = new Date().toISOString().slice(0, 10);
+    const isToday = ymd === todayYMD;
+
+    for (const r of rooms) {
+      const roomDisabled = r.room_status !== 1;
+      for (const s of slots) {
+        if (roomDisabled) {
+          disabled++;
+          continue;
+        }
+        const st = String(s.start_time).slice(0, 5);
+        const slotMap = byRoomSlot.get(r.room_id);
+        if (slotMap && slotMap.has(s.slot_id)) {
+          const status = slotMap.get(s.slot_id);
+          if (status === "pending") pending++;
+          else reserved++;
+        } else if (isToday && nowHHMM >= st) {
+          // "passed" doesn't contribute to available/pending/reserved; treat as not available
+          // If you want passed to count as unavailable but not disabled, just ignore here.
+        } else {
+          available++;
+        }
+      }
+    }
+
+    res.json({ ok: true, date: ymd, available, pending, reserved, disabled });
+  } catch (e) {
+    console.error("lecturer summary error:", e);
     res.status(500).json({ error: "Database error" });
   }
 });
