@@ -8,7 +8,7 @@ const cors = require("cors");
 const argon2 = require("argon2");
 const jwt = require("jsonwebtoken");
 const con = require("./config/config");
-
+const fs = require('fs');
 const app = express();
 const JWT_SECRET = "your_super_secret_change_me";
 const PUBLIC_BASE = "http://localhost:3000";
@@ -22,8 +22,9 @@ app.use(cors());
 // ---------- static image hosting ----------
 const uploadsDir = path.join(__dirname, "uploads");
 app.use("/uploads", express.static(uploadsDir));
-
-// POST /rooms/:id/image  (staff)
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
@@ -103,7 +104,7 @@ app.get("/password/:raw", async (req, res) => {
   }
 });
 
-// POST /login   { email, password }
+// POST /api/login   { email, password }
 app.post("/api/login", (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
@@ -145,7 +146,7 @@ app.post("/api/login", (req, res) => {
   });
 });
 
-// POST /register/create
+// POST /api/register/create
 app.post("/api/register/create", async (req, res) => {
   const {
     email,
@@ -166,7 +167,8 @@ app.post("/api/register/create", async (req, res) => {
     const dup = await q("SELECT user_id FROM users WHERE email = ? LIMIT 1", [
       email,
     ]);
-    if (dup.length) return res.status(409).json({ error: "Email already registered" });
+    if (dup.length)
+      return res.status(409).json({ error: "Email already registered" });
 
     let toStore = password_hash;
     if (!toStore) {
@@ -210,7 +212,7 @@ app.post("/api/register/create", async (req, res) => {
   }
 });
 
-// GET /user_auth_jwt_web_token
+// GET /common/user_auth
 app.get("/common/user_auth", requireAuth, async (req, res) => {
   try {
     const rows = await q(
@@ -250,8 +252,9 @@ app.get("/time-slots", async (_req, res) => {
   }
 });
 
-// GET /rooms/availability?date=YYYY-MM-DD
-// returns { ok, date, slots:[{slot_id,start_time,end_time}], rooms:[{id,name,description,image_url,room_status,statuses:{'HH:MM - HH:MM': 'available|pending|reserved|passed|disabled'}}] }
+// ============================================================================
+// ROOMS AVAILABILITY (now includes capacity)
+// ============================================================================
 app.get("/common/rooms/availability", async (req, res) => {
   try {
     const ymd = String(req.query.date || "").slice(0, 10);
@@ -260,7 +263,7 @@ app.get("/common/rooms/availability", async (req, res) => {
     }
 
     const rooms = await q(
-      "SELECT room_id, room_name, room_status, description, image FROM room ORDER BY room_name"
+      "SELECT room_id, room_name, room_status, description, image, capacity FROM room ORDER BY room_name"
     );
     const slots = await q(
       "SELECT slot_id, start_time, end_time FROM time_slot ORDER BY slot_id"
@@ -280,7 +283,10 @@ app.get("/common/rooms/availability", async (req, res) => {
     for (const b of books) {
       if (!byRoomSlot.has(b.room_id)) byRoomSlot.set(b.room_id, new Map());
       const map = byRoomSlot.get(b.room_id);
-      map.set(b.slot_id, b.booking_status === "Waiting" ? "pending" : "reserved");
+      map.set(
+        b.slot_id,
+        b.booking_status === "Waiting" ? "pending" : "reserved"
+      );
     }
 
     const now = new Date();
@@ -288,11 +294,11 @@ app.get("/common/rooms/availability", async (req, res) => {
     const todayYMD = new Date().toISOString().slice(0, 10);
     const isToday = ymd === todayYMD;
 
-    const slotLabels = slots.map((s) => {
-      const st = String(s.start_time).slice(0, 5);
-      const et = String(s.end_time).slice(0, 5);
-      return { id: s.slot_id, label: `${st} - ${et}`, start: st };
-    });
+const slotLabels = slots.map((s) => {
+  const st = String(s.start_time).slice(0, 5);
+  const et = String(s.end_time).slice(0, 5);
+  return { id: s.slot_id, label: `${st} - ${et}`, start: st };
+});
 
     const outRooms = rooms.map((r) => {
       const statuses = {};
@@ -318,6 +324,7 @@ app.get("/common/rooms/availability", async (req, res) => {
           ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}`
           : null,
         room_status: r.room_status,
+        capacity: Number(r.capacity ?? 0), 
         statuses,
       };
     });
@@ -339,7 +346,7 @@ app.get("/common/rooms/availability", async (req, res) => {
 });
 
 // ============================================================================
-// BOOKINGS (student can create; JWT auth)
+// Student BOOKINGS
 // ============================================================================
 app.post("/student/bookings", requireAuth, async (req, res) => {
   try {
@@ -364,7 +371,9 @@ app.post("/student/bookings", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Cannot book in the past" });
     }
     if (booking_date === ymdToday && nowHHMM >= slotStart) {
-      return res.status(400).json({ error: "This time slot has already started today" });
+      return res
+        .status(400)
+        .json({ error: "This time slot has already started today" });
     }
 
     const r = await q("SELECT room_status FROM room WHERE room_id = ?", [
@@ -420,7 +429,7 @@ app.post("/student/bookings", requireAuth, async (req, res) => {
   }
 });
 
-// GET /bookings/mine (student)
+// GET Booking of(student)
 app.get("/student/bookings/history", requireAuth, async (req, res) => {
   try {
     const me = req.user;
@@ -467,16 +476,12 @@ app.get("/student/bookings/history", requireAuth, async (req, res) => {
 });
 
 // ============================================================================
-// LECTURER ENDPOINTS (pending/history/approve/reject/summary)
+// LECTURER: pending/history/approve/reject
 // ============================================================================
+const ensureLecturer = [requireAuth, requireRole("lecturer")];
 
-// helper to ensure lecturer-like roles
-const ensureLecturer = [requireAuth, requireRole("lecturer", "staff")];
-
-// GET /lecturer/bookings/pending
-app.get("/lecturer/bookings/pending", ensureLecturer, async (req, res) => {
+app.get("/lecturer/bookings/pending", ensureLecturer, async (_req, res) => {
   try {
-    // All Waiting bookings (no approver yet)
     const rows = await q(
       `
       SELECT b.booking_id, b.booking_date, b.booking_status, b.user_id, b.slot_id,
@@ -512,10 +517,8 @@ app.get("/lecturer/bookings/pending", ensureLecturer, async (req, res) => {
   }
 });
 
-// GET /lecturer/bookings/history
 app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
   try {
-    // Bookings this lecturer decided (Approved/Rejected)
     const rows = await q(
       `
       SELECT b.booking_id, b.booking_date, b.booking_status, b.reason AS reject_reason,
@@ -531,7 +534,6 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
       JOIN users a      ON a.user_id = b.approver_id
       WHERE b.approver_id = ?
         AND b.booking_status IN ('Approved','Rejected')
-
       ORDER BY b.booking_id DESC
     `,
       [req.user.id]
@@ -559,23 +561,21 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
     console.error("lecturer history error:", e);
     res.status(500).json({ error: "Database error" });
   }
-  
 });
 
-// POST /lecturer/bookings/:id/approve
 app.post("/lecturer/bookings/:id/approve",
   ensureLecturer,
   async (req, res) => {
     try {
       const id = Number(req.params.id) || 0;
-
-      // ensure exists & still Waiting
       const rows = await q(
         "SELECT booking_id FROM booking WHERE booking_id = ? AND booking_status = 'Waiting' LIMIT 1",
         [id]
       );
       if (!rows.length)
-        return res.status(404).json({ error: "Booking not found or not Waiting" });
+        return res
+          .status(404)
+          .json({ error: "Booking not found or not Waiting" });
 
       await q(
         `
@@ -596,7 +596,6 @@ app.post("/lecturer/bookings/:id/approve",
   }
 );
 
-// POST /lecturer/bookings/:id/reject {reason}
 app.post("/lecturer/bookings/:id/reject", ensureLecturer, async (req, res) => {
   try {
     const id = Number(req.params.id) || 0;
@@ -628,18 +627,243 @@ app.post("/lecturer/bookings/:id/reject", ensureLecturer, async (req, res) => {
   }
 });
 
+// ============================================================================
+// STAFF endpoints (pending/history/rooms list/toggle/edit/create)  — with capacity
+// ============================================================================
+const ensureStaff = [requireAuth, requireRole("staff")];
+
+
+app.get("/staff/bookings/pending", ensureStaff, async (_req, res) => {
+  try {
+    const rows = await q(`
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.user_id, b.slot_id,
+             r.room_name,
+             t.start_time, t.end_time,
+             u.first_name AS student_first, u.last_name AS student_last
+      FROM booking b
+      JOIN room r      ON r.room_id = b.room_id
+      JOIN time_slot t ON t.slot_id = b.slot_id
+      JOIN users u     ON u.user_id = b.user_id
+      WHERE b.booking_status = 'Waiting'
+      ORDER BY b.booking_id DESC
+    `);
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: "Waiting",
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      booked_by_name: `${b.student_first}${
+        b.student_last ? " " + b.student_last : ""
+      }`,
+    }));
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error("staff pending error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.get("/staff/bookings/history", ensureStaff, async (_req, res) => {
+  try {
+    const rows = await q(`
+      SELECT b.booking_id, b.booking_date, b.booking_status, b.reason AS reject_reason,
+             b.slot_id,
+             r.room_name,
+             t.start_time, t.end_time,
+             u.first_name AS student_first, u.last_name AS student_last,
+             a.first_name AS approver_first, a.last_name AS approver_last
+      FROM booking b
+      JOIN room r       ON r.room_id = b.room_id
+      JOIN time_slot t  ON t.slot_id = b.slot_id
+      JOIN users u      ON u.user_id = b.user_id           -- student
+      LEFT JOIN users a ON a.user_id = b.approver_id        -- may be null
+      WHERE b.booking_status IN ('Approved','Rejected')
+      ORDER BY b.booking_id DESC
+    `);
+
+    const bookings = rows.map((b) => ({
+      booking_id: b.booking_id,
+      booking_date: b.booking_date,
+      booking_status: b.booking_status,
+      reject_reason: b.reject_reason || "",
+      room_name: b.room_name,
+      slot_id: b.slot_id,
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+      booked_by_name: `${b.student_first}${
+        b.student_last ? " " + b.student_last : ""
+      }`,
+      approver_name: b.approver_first
+        ? `${b.approver_first}${b.approver_last ? " " + b.approver_last : ""}`
+        : "",
+    }));
+    res.json({ ok: true, bookings });
+  } catch (e) {
+    console.error("staff history error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// GET /staff/rooms/management
+app.get('/staff/rooms/management', ensureStaff, async (req, res) => {
+  try {
+    const rows = await q(`
+      SELECT
+        r.room_id          AS id,
+        r.room_name        AS name,
+        r.room_status,
+        r.description,
+        r.image,
+        COALESCE(r.capacity,0) AS capacity,
+        (
+          SELECT COUNT(*)
+          FROM booking b
+          WHERE b.room_id = r.room_id
+            AND b.booking_status IN ('Waiting','Approved')
+            AND b.booking_date >= CURDATE()
+        ) AS active_bookings
+      FROM room r
+      ORDER BY r.room_name ASC
+    `);
+
+    const rooms = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      capacity: Number(r.capacity) || 0,
+      image_url: r.image ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image)}` : '',
+      room_status: r.room_status,          // 1 enabled, 0 disabled
+      active_bookings: Number(r.active_bookings) || 0,
+    }));
+
+    res.json({ ok: true, rooms });
+  } catch (e) {
+    console.error('staff rooms management error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Toggle room enabled/disabled (block disable if active bookings exist from today onward)
+app.post("/staff/rooms/:id/toggle",
+  ensureStaff,
+  async (req, res) => {
+    try {
+      const roomId = Number(req.params.id) || 0;
+      const rooms = await q(
+        "SELECT room_status FROM room WHERE room_id = ? LIMIT 1",
+        [roomId]
+      );
+      if (!rooms.length) return res.status(404).json({ error: "Room not found" });
+
+      const current = Number(rooms[0].room_status) === 1;
+      const wantDisable = current === true;
+      const wantEnable = current === false;
+
+      if (wantDisable) {
+        const today = new Date().toISOString().slice(0, 10);
+        const active = await q(
+          `
+          SELECT 1
+          FROM booking
+          WHERE room_id = ?
+            AND booking_status IN ('Waiting','Approved')
+            AND booking_date >= ?
+          LIMIT 1
+        `,
+          [roomId, today]
+        );
+        if (active.length) {
+          return res
+            .status(409)
+            .json({ error: "Cannot disable this room while it has active bookings." });
+        }
+        await q("UPDATE room SET room_status = 0 WHERE room_id = ?", [roomId]);
+        return res.json({ ok: true, room_status: 0 });
+      }
+
+      if (wantEnable) {
+        await q("UPDATE room SET room_status = 1 WHERE room_id = ?", [roomId]);
+        return res.json({ ok: true, room_status: 1 });
+      }
+
+      return res.json({ ok: true, room_status: current ? 1 : 0 });
+    } catch (e) {
+      console.error("staff toggle error:", e);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+// POST /staff/rooms/:id/edit   { name, description, capacity }
+app.post('/staff/rooms/:id/edit', [requireAuth, requireRole('staff')], async (req, res) => {
+  try {
+    const roomId = Number(req.params.id) || 0;
+    const { name, description, capacity } = req.body || {};
+
+    if (!roomId) return res.status(400).json({ error: 'Invalid room id' });
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'Room name is required' });
+    }
+    const capNum = Number.parseInt(capacity, 10);
+    if (Number.isNaN(capNum) || capNum < 0) {
+      return res.status(400).json({ error: 'Capacity must be a non-negative integer' });
+    }
+
+    const rows = await q('SELECT room_id FROM room WHERE room_id = ? LIMIT 1', [roomId]);
+    if (!rows.length) return res.status(404).json({ error: 'Room not found' });
+
+    await q(
+      'UPDATE room SET room_name = ?, description = ?, capacity = ? WHERE room_id = ?',
+      [String(name).trim(), String(description || '').trim(), capNum, roomId]
+    );
+
+    const updated = await q(`
+      SELECT room_id   AS id,
+             room_name AS name,
+             COALESCE(description,'') AS description,
+             COALESCE(image,'')       AS image_file,
+             COALESCE(capacity,0)     AS capacity,
+             room_status
+      FROM room WHERE room_id = ? LIMIT 1
+    `, [roomId]);
+
+    const r = updated[0];
+    return res.json({
+      ok: true,
+      room: {
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        capacity: Number(r.capacity) || 0,
+        image_url: r.image_file ? `${PUBLIC_BASE}/uploads/${encodeURIComponent(r.image_file)}` : '',
+        room_status: Number(r.room_status),
+      }
+    });
+  } catch (e) {
+    console.error('staff edit room error:', e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Upload/replace room image (kept same)
 app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
   try {
     const id = req.params.id;
     if (!req.file) return res.status(400).send("No file uploaded");
+
     await q("UPDATE room SET image = ? WHERE room_id = ?", [
       req.file.filename,
       id,
     ]);
+
     res.json({
       ok: true,
       filename: req.file.filename,
-      url: `${PUBLIC_BASE}/uploads/${req.file.filename}`,
+      url: `${PUBLIC_BASE}/uploads/${encodeURIComponent(req.file.filename)}`,
     });
   } catch (e) {
     console.error("upload error:", e);
@@ -647,9 +871,48 @@ app.post("/rooms/:id/image", upload.single("image"), async (req, res) => {
   }
 });
 
-// ============================================================================
-// START SERVER
-// ============================================================================
+// ===== STAFF: create room =====
+app.post('/staff/rooms/create', [requireAuth, requireRole('staff')], async (req, res) => {
+  try {
+    const { name, capacity, description } = req.body || {};
+    const roomName = String(name || '').trim();
+    const cap = Number.isFinite(Number(capacity)) ? Number(capacity) : 0;
+    const desc = String(description || '').trim();
+
+    if (!roomName) return res.status(400).json({ error: 'Room name is required' });
+    if (cap < 0)     return res.status(400).json({ error: 'Capacity must be >= 0' });
+
+    const dup = await q('SELECT room_id FROM room WHERE room_name = ? LIMIT 1', [roomName]);
+    if (dup.length) return res.status(409).json({ error: 'Room name already exists' });
+
+    // image is NOT NULL in your schema, so use '' as placeholder
+    const ins = await q(
+      `INSERT INTO room (room_name, room_status, capacity, description, image)
+       VALUES (?, 1, ?, ?, '')`,
+      [roomName, cap, desc]
+    );
+
+    const newId = Number(ins.insertId);
+
+    // 👇 Add id at top-level
+    return res.status(201).json({
+      ok: true,
+      id: newId,
+      room: {
+        id: newId,
+        name: roomName,
+        capacity: cap,
+        description: desc,
+        room_status: 1,
+        image_url: '',
+      }
+    });
+  } catch (e) {
+    console.error('staff create room error:', e);
+    return res.status(500).json({ error: 'Database error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
