@@ -14,12 +14,12 @@ const JWT_SECRET = "your_super_secret_change_me";
 const PUBLIC_BASE = "http://localhost:3000";
 const PORT = 3000;
 
-// ---------- core middleware ----------
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-// ---------- static image hosting ----------
+
 const uploadsDir = path.join(__dirname, "uploads");
 app.use("/uploads", express.static(uploadsDir));
 if (!fs.existsSync(uploadsDir)) {
@@ -35,7 +35,6 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ---------- helpers ----------
 function q(sql, params = []) {
   return new Promise((resolve, reject) => {
     con.query(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
@@ -81,28 +80,6 @@ function requireRole(...roles) {
     next();
   };
 }
-
-// ============================================================================
-// AUTH
-// ============================================================================
-app.get("/password/:raw", async (req, res) => {
-  const raw = req.params.raw || "";
-  if (!raw) return res.status(400).send("Password required");
-  try {
-    const hash = await argon2.hash(raw, {
-      type: argon2.argon2id,
-      timeCost: 3,
-      memoryCost: 1 << 16,
-      parallelism: 1,
-      hashLength: 32,
-      saltLength: 16,
-    });
-    res.send(hash);
-  } catch (e) {
-    console.error("argon2 hash error:", e);
-    res.status(500).send("Hashing failed");
-  }
-});
 
 // POST /api/login   { email, password }
 app.post("/api/login", (req, res) => {
@@ -436,11 +413,20 @@ app.get("/student/bookings/history", requireAuth, async (req, res) => {
 
     const rows = await q(
       `
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.Objective,
-             b.reason AS reject_reason, b.approver_id,
-             r.room_id, r.room_name,
-             t.slot_id, t.start_time, t.end_time,
-             u2.first_name AS approver_first, u2.last_name AS approver_last
+      SELECT
+        b.booking_id,
+        DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date_ymd,
+        b.booking_status,
+        b.Objective,
+        b.reason AS reject_reason,
+        b.approver_id,
+        r.room_id,
+        r.room_name,
+        t.slot_id,
+        t.start_time,
+        t.end_time,
+        u2.first_name AS approver_first,
+        u2.last_name  AS approver_last
       FROM booking b
       JOIN room r       ON r.room_id = b.room_id
       JOIN time_slot t  ON t.slot_id = b.slot_id
@@ -453,13 +439,15 @@ app.get("/student/bookings/history", requireAuth, async (req, res) => {
 
     const bookings = rows.map((b) => ({
       booking_id: b.booking_id,
-      booking_date: b.booking_date,
-      booking_status: b.booking_status, // Waiting | Approved | Rejected
+      booking_date: b.booking_date_ymd,        // 👈 fixed
+      booking_status: b.booking_status,        // Waiting | Approved | Rejected
       Objective: b.Objective,
       reject_reason: b.reject_reason || "",
       approver_id: b.approver_id,
       approver_name: b.approver_first
-        ? `${b.approver_first}${b.approver_last ? " " + b.approver_last : ""}`
+        ? `${b.approver_first}${
+            b.approver_last ? " " + b.approver_last : ""
+          }`
         : "",
       room_id: b.room_id,
       room_name: b.room_name,
@@ -484,10 +472,17 @@ app.get("/lecturer/bookings/pending", ensureLecturer, async (_req, res) => {
   try {
     const rows = await q(
       `
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.user_id, b.slot_id,
-             r.room_name,
-             t.start_time, t.end_time,
-             u.first_name AS student_first, u.last_name AS student_last
+      SELECT
+        b.booking_id,
+        DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date_ymd,
+        b.booking_status,
+        b.user_id,
+        b.slot_id,
+        r.room_name,
+        t.start_time,
+        t.end_time,
+        u.first_name AS student_first,
+        u.last_name  AS student_last
       FROM booking b
       JOIN room r      ON r.room_id = b.room_id
       JOIN time_slot t ON t.slot_id = b.slot_id
@@ -499,7 +494,7 @@ app.get("/lecturer/bookings/pending", ensureLecturer, async (_req, res) => {
 
     const bookings = rows.map((b) => ({
       booking_id: b.booking_id,
-      booking_date: b.booking_date,
+      booking_date: b.booking_date_ymd,        // 👈 fixed
       booking_status: "Waiting",
       room_name: b.room_name,
       slot_id: b.slot_id,
@@ -521,12 +516,19 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
   try {
     const rows = await q(
       `
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.reason AS reject_reason,
-             b.slot_id,
-             r.room_name,
-             t.start_time, t.end_time,
-             u.first_name AS student_first, u.last_name AS student_last,
-             a.first_name AS approver_first, a.last_name AS approver_last
+      SELECT
+        b.booking_id,
+        DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date_ymd,
+        b.booking_status,
+        b.reason AS reject_reason,
+        b.slot_id,
+        r.room_name,
+        t.start_time,
+        t.end_time,
+        u.first_name AS student_first,
+        u.last_name  AS student_last,
+        a.first_name AS approver_first,
+        a.last_name  AS approver_last
       FROM booking b
       JOIN room r       ON r.room_id = b.room_id
       JOIN time_slot t  ON t.slot_id = b.slot_id
@@ -541,8 +543,8 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
 
     const bookings = rows.map((b) => ({
       booking_id: b.booking_id,
-      booking_date: b.booking_date,
-      booking_status: b.booking_status, // Approved | Rejected
+      booking_date: b.booking_date_ymd,        // 👈 fixed
+      booking_status: b.booking_status,        // Approved | Rejected
       reject_reason: b.reject_reason || "",
       room_name: b.room_name,
       slot_id: b.slot_id,
@@ -563,9 +565,7 @@ app.get("/lecturer/bookings/history", ensureLecturer, async (req, res) => {
   }
 });
 
-app.post("/lecturer/bookings/:id/approve",
-  ensureLecturer,
-  async (req, res) => {
+app.post("/lecturer/bookings/:id/approve",ensureLecturer, async (req, res) => {
     try {
       const id = Number(req.params.id) || 0;
       const rows = await q(
@@ -627,19 +627,53 @@ app.post("/lecturer/bookings/:id/reject", ensureLecturer, async (req, res) => {
   }
 });
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ============================================================================
 // STAFF endpoints (pending/history/rooms list/toggle/edit/create)  — with capacity
 // ============================================================================
 const ensureStaff = [requireAuth, requireRole("staff")];
 
-
 app.get("/staff/bookings/pending", ensureStaff, async (_req, res) => {
   try {
     const rows = await q(`
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.user_id, b.slot_id,
-             r.room_name,
-             t.start_time, t.end_time,
-             u.first_name AS student_first, u.last_name AS student_last
+      SELECT
+        b.booking_id,
+        DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date_ymd,
+        b.booking_status,
+        b.user_id,
+        b.slot_id,
+        r.room_name,
+        t.start_time,
+        t.end_time,
+        u.first_name AS student_first,
+        u.last_name  AS student_last
       FROM booking b
       JOIN room r      ON r.room_id = b.room_id
       JOIN time_slot t ON t.slot_id = b.slot_id
@@ -650,7 +684,7 @@ app.get("/staff/bookings/pending", ensureStaff, async (_req, res) => {
 
     const bookings = rows.map((b) => ({
       booking_id: b.booking_id,
-      booking_date: b.booking_date,
+      booking_date: b.booking_date_ymd,        // 👈 fixed
       booking_status: "Waiting",
       room_name: b.room_name,
       slot_id: b.slot_id,
@@ -670,12 +704,19 @@ app.get("/staff/bookings/pending", ensureStaff, async (_req, res) => {
 app.get("/staff/bookings/history", ensureStaff, async (_req, res) => {
   try {
     const rows = await q(`
-      SELECT b.booking_id, b.booking_date, b.booking_status, b.reason AS reject_reason,
-             b.slot_id,
-             r.room_name,
-             t.start_time, t.end_time,
-             u.first_name AS student_first, u.last_name AS student_last,
-             a.first_name AS approver_first, a.last_name AS approver_last
+      SELECT
+        b.booking_id,
+        DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date_ymd,
+        b.booking_status,
+        b.reason AS reject_reason,
+        b.slot_id,
+        r.room_name,
+        t.start_time,
+        t.end_time,
+        u.first_name AS student_first,
+        u.last_name  AS student_last,
+        a.first_name AS approver_first,
+        a.last_name  AS approver_last
       FROM booking b
       JOIN room r       ON r.room_id = b.room_id
       JOIN time_slot t  ON t.slot_id = b.slot_id
@@ -687,7 +728,7 @@ app.get("/staff/bookings/history", ensureStaff, async (_req, res) => {
 
     const bookings = rows.map((b) => ({
       booking_id: b.booking_id,
-      booking_date: b.booking_date,
+      booking_date: b.booking_date_ymd,        // 👈 fixed
       booking_status: b.booking_status,
       reject_reason: b.reject_reason || "",
       room_name: b.room_name,
@@ -698,7 +739,9 @@ app.get("/staff/bookings/history", ensureStaff, async (_req, res) => {
         b.student_last ? " " + b.student_last : ""
       }`,
       approver_name: b.approver_first
-        ? `${b.approver_first}${b.approver_last ? " " + b.approver_last : ""}`
+        ? `${b.approver_first}${
+            b.approver_last ? " " + b.approver_last : ""
+          }`
         : "",
     }));
     res.json({ ok: true, bookings });
